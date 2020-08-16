@@ -17,6 +17,11 @@ type JsonEncodable interface {
 }
 
 // FieldNameMapper provides custom mapping between Go and JavaScript property names.
+//
+// A FieldNameMapper may optionally have a SkipValue method for advanced mapping that depend on the actual value:
+//
+// // SkipValue returns a function that allows custom values (typically zero values) to be skipped
+// SkipValue(t reflect.Type, f reflect.StructField) func(reflect.Value) bool
 type FieldNameMapper interface {
 	// FieldName returns a JavaScript name for the given struct field in the given type.
 	// If this method returns "" the field becomes hidden.
@@ -65,9 +70,15 @@ func (u uncapFieldNameMapper) MethodName(_ reflect.Type, m reflect.Method) strin
 	return uncapitalize(m.Name)
 }
 
+type skipValuer interface {
+	// SkipValue returns a function that allows custom values (typically zero values) to be skipped
+	SkipValue(t reflect.Type, f reflect.StructField) func(reflect.Value) bool
+}
+
 type reflectFieldInfo struct {
 	Index     []int
 	Anonymous bool
+	SkipValue func(reflect.Value) bool
 }
 
 type reflectTypeInfo struct {
@@ -132,9 +143,12 @@ func (o *objectGoReflect) getStr(name unistring.String, receiver Value) Value {
 	return o.baseObject.getStr(name, receiver)
 }
 
-func (o *objectGoReflect) _getField(jsName string) reflect.Value {
+func (o *objectGoReflect) _getField(jsName string, read bool) reflect.Value {
 	if info, exists := o.valueTypeInfo.Fields[jsName]; exists {
 		v := o.value.FieldByIndex(info.Index)
+		if read && info.SkipValue != nil && info.SkipValue(v) {
+			return reflect.Value{}
+		}
 		return v
 	}
 
@@ -158,7 +172,7 @@ func (o *objectGoReflect) getAddr(v reflect.Value) reflect.Value {
 
 func (o *objectGoReflect) _get(name string) Value {
 	if o.value.Kind() == reflect.Struct {
-		if v := o._getField(name); v.IsValid() {
+		if v := o._getField(name, true); v.IsValid() {
 			return o.val.runtime.ToValue(o.getAddr(v).Interface())
 		}
 	}
@@ -173,7 +187,7 @@ func (o *objectGoReflect) _get(name string) Value {
 func (o *objectGoReflect) getOwnPropStr(name unistring.String) Value {
 	n := name.String()
 	if o.value.Kind() == reflect.Struct {
-		if v := o._getField(n); v.IsValid() {
+		if v := o._getField(n, true); v.IsValid() {
 			return &valueProperty{
 				value:      o.val.runtime.ToValue(o.getAddr(v).Interface()),
 				writable:   v.CanSet(),
@@ -211,7 +225,7 @@ func (o *objectGoReflect) setForeignStr(name unistring.String, val, receiver Val
 
 func (o *objectGoReflect) _put(name string, val Value, throw bool) (has, ok bool) {
 	if o.value.Kind() == reflect.Struct {
-		if v := o._getField(name); v.IsValid() {
+		if v := o._getField(name, false); v.IsValid() {
 			if !v.CanSet() {
 				o.val.runtime.typeErrorResult(throw, "Cannot assign to a non-addressable or read-only property %s of a host object", name)
 				return true, false
@@ -265,7 +279,7 @@ func (o *objectGoReflect) defineOwnPropertyStr(name unistring.String, descr Prop
 
 func (o *objectGoReflect) _has(name string) bool {
 	if o.value.Kind() == reflect.Struct {
-		if v := o._getField(name); v.IsValid() {
+		if v := o._getField(name, true); v.IsValid() {
 			return true
 		}
 	}
@@ -355,10 +369,12 @@ type goreflectPropIter struct {
 
 func (i *goreflectPropIter) nextField() (propIterItem, iterNextFunc) {
 	names := i.o.valueTypeInfo.FieldNames
-	if i.idx < len(names) {
+	for i.idx < len(names) {
 		name := names[i.idx]
 		i.idx++
-		return propIterItem{name: unistring.NewFromString(name), enumerable: _ENUM_TRUE}, i.nextField
+		if v := i.o._getField(name, true); v.IsValid() {
+			return propIterItem{name: unistring.NewFromString(name), enumerable: _ENUM_TRUE}, i.nextField
+		}
 	}
 
 	i.idx = 0
@@ -393,7 +409,9 @@ func (o *objectGoReflect) enumerateUnfiltered() iterNextFunc {
 func (o *objectGoReflect) ownKeys(_ bool, accum []Value) []Value {
 	// all own keys are enumerable
 	for _, name := range o.valueTypeInfo.FieldNames {
-		accum = append(accum, newStringValue(name))
+		if v := o._getField(name, true); v.IsValid() {
+			accum = append(accum, newStringValue(name))
+		}
 	}
 
 	for _, name := range o.valueTypeInfo.MethodNames {
@@ -420,14 +438,23 @@ func (o *objectGoReflect) equal(other objectImpl) bool {
 
 func (r *Runtime) buildFieldInfo(t reflect.Type, index []int, info *reflectTypeInfo) {
 	n := t.NumField()
+	var sv skipValuer
+	if v, ok := r.fieldNameMapper.(skipValuer); ok {
+		sv = v
+	}
+
 	for i := 0; i < n; i++ {
 		field := t.Field(i)
 		name := field.Name
+		var skipValueFn func(reflect.Value) bool
 		if !ast.IsExported(name) {
 			continue
 		}
 		if r.fieldNameMapper != nil {
 			name = r.fieldNameMapper.FieldName(t, field)
+			if sv != nil {
+				skipValueFn = sv.SkipValue(t, field)
+			}
 		}
 
 		if name != "" {
@@ -449,6 +476,7 @@ func (r *Runtime) buildFieldInfo(t reflect.Type, index []int, info *reflectTypeI
 				info.Fields[name] = reflectFieldInfo{
 					Index:     idx,
 					Anonymous: field.Anonymous,
+					SkipValue: skipValueFn,
 				}
 			}
 			if field.Anonymous {
